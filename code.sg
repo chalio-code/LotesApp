@@ -1,0 +1,1110 @@
+/*****************************************************************************
+ *  Lotes · Sistema de venta de terrenos a plazos (México)
+ *  Archivo 1/2 : Code.gs   (backend en Google Apps Script)
+ *  Archivo 2/2 : Index.html (interfaz)
+ *
+ *  INSTALACIÓN RÁPIDA
+ *   1. Crea una Hoja de cálculo de Google → Extensiones → Apps Script.
+ *   2. Pega este archivo como Code.gs y crea un archivo HTML llamado "Index".
+ *   3. Configuración del proyecto → zona horaria: (GMT-08:00) America/Tijuana
+ *      (o la que uses; es la que se usa para fechas y vencimientos).
+ *   4. Ejecuta  setupDatabase()  (o menú "🏡 Inmobiliaria" al recargar la hoja).
+ *      Crea hojas, columnas, formatos, listas desplegables y el usuario
+ *      administrador. La contraseña temporal sale en la alerta y en el registro.
+ *   5. Ejecuta  instalarTriggers()  para activar los avisos diarios de abonos.
+ *   6. Implementar → Nueva implementación → Aplicación web
+ *        Ejecutar como: Yo   ·   Quién tiene acceso: Cualquier persona
+ *      (el acceso real lo controla el login propio de la app).
+ *
+ *  SEGURIDAD
+ *   · Contraseñas: SHA-256 con sal por usuario + pimienta secreta + 200 rondas.
+ *   · Sesión: token aleatorio en CacheService (máx. 6 h, se renueva al usar).
+ *   · Bloqueo 15 min tras 5 intentos fallidos por correo.
+ *   · Cada acción valida token + rol + usuario activo EN EL SERVIDOR.
+ *   · Las funciones administrativas solo las puede ejecutar el propietario.
+ *   · Los textos se limpian contra inyección de fórmulas en la hoja.
+ *   · NO compartas la hoja de cálculo con los vendedores (contiene los hashes).
+ *****************************************************************************/
+
+/* ============================ CONFIGURACIÓN ============================== */
+const APP = {
+  SESION_SEG: 21600,   // 6 h (máximo de CacheService)
+  CACHE_SEG: 21600,
+  CHUNK: 30000,        // caracteres por trozo de caché (límite 100 KB por clave)
+  HASH_ROUNDS: 200,
+  MAX_INTENTOS: 5,
+  BLOQUEO_SEG: 900,
+  VENTANA_DIAS: 60     // ventana de cobranza hacia adelante (caché ligero)
+};
+
+const AMBOS = ['admin', 'vendedor'];
+const ADMIN = ['admin'];
+
+/* Esquema de la "base de datos": una hoja por tabla */
+const TABLAS = {
+  USU: { hoja: 'Usuarios',          color: '#6d28d9', cols: ['ID','Nombre','Email','Rol','Hash','Salt','Activo','CambiarPass','UltimoAcceso','Creado'] },
+  FRA: { hoja: 'Fraccionamientos',  color: '#0f766e', cols: ['ID','Nombre','Ubicacion','Municipio','Estado','Descripcion','PrecioM2','Estatus','Creado'] },
+  LOT: { hoja: 'Lotes',             color: '#0369a1', cols: ['ID','FraccID','Manzana','Lote','Frente','Fondo','Area','PrecioM2','Precio','Estatus','VentaID','Notas'] },
+  CLI: { hoja: 'Clientes',          color: '#b45309', cols: ['ID','Nombre','Telefono','Email','CURP','RFC','INE','Domicilio','EstadoCivil','Ocupacion','Beneficiario','VendedorID','Notas','Creado'] },
+  VEN: { hoja: 'Ventas',            color: '#15803d', cols: ['ID','Fecha','ClienteID','LoteID','VendedorID','Descuento','PrecioFinal','Enganche','Plazo','TasaAnual','Mensualidad','DiaPago','PrimerPago','Estatus','Pagado','Saldo','Notas'] },
+  ABO: { hoja: 'Abonos',            color: '#be123c', cols: ['VentaID','Num','Vence','Monto','Pagado','FechaPago','Metodo','Referencia','Estatus','UltAviso','Usuario'] },
+  CFG: { hoja: 'Config',            color: '#475569', cols: ['Clave','Valor','Descripcion'] },
+  LOG: { hoja: 'Bitacora',          color: '#64748b', cols: ['Cuando','Usuario','Accion','Detalle'] }
+};
+
+const MONEDA    = new Set(['PrecioM2','Precio','Descuento','PrecioFinal','Enganche','Mensualidad','Pagado','Saldo','Monto']);
+const FECHA     = new Set(['Fecha','PrimerPago','Vence','FechaPago','UltAviso']);
+const FECHAHORA = new Set(['Creado','UltimoAcceso','Cuando']);
+const TEXTO     = new Set(['ID','VentaID','ClienteID','LoteID','FraccID','VendedorID','Manzana','Lote','Telefono','CURP','RFC','INE','Referencia','Clave']);
+const DEC       = new Set(['Frente','Fondo','Area']);
+const ENT       = new Set(['Plazo','DiaPago','Num','TasaAnual']);
+
+const LISTAS = {
+  'USU.Rol': ['admin','vendedor'], 'USU.Activo': ['SI','NO'], 'USU.CambiarPass': ['SI','NO'],
+  'FRA.Estatus': ['Activo','Inactivo'],
+  'LOT.Estatus': ['Disponible','Apartado','Vendido'],
+  'VEN.Estatus': ['Contrato','Activa','Liquidada','Cancelada'],
+  'ABO.Estatus': ['Pendiente','Parcial','Pagado']
+};
+
+/* Parámetros editables desde la pantalla Configuración */
+const CFG_DEF = [
+  ['EMPRESA_NOMBRE','Inmobiliaria Los Pinos','Nombre comercial'],
+  ['EMPRESA_RAZON','Inmobiliaria Ranchito S.A. de C.V.','Razón social (para contratos)'],
+  ['EMPRESA_RFC','XXX000000XXX','RFC de la empresa'],
+  ['EMPRESA_DIRECCION','Domicilio fiscal de la empresa','Domicilio'],
+  ['EMPRESA_TEL','','Teléfono de contacto'],
+  ['EMPRESA_EMAIL','','Correo de contacto (se usa como Reply-To)'],
+  ['REPRESENTANTE','Representante legal','Nombre de quien firma por la empresa'],
+  ['CIUDAD','Tijuana, Baja California','Ciudad/jurisdicción para contratos'],
+  ['DIAS_AVISO','3','Días de anticipación para avisar un abono'],
+  ['AVISO_CLIENTE','SI','Enviar correo al cliente (SI/NO)'],
+  ['HORA_NOTIF','8','Hora del envío diario (0-23)'],
+  ['MIN_ENGANCHE_PCT','10','% mínimo de enganche para vendedores'],
+  ['MAX_DESCUENTO_PCT','5','% máximo de descuento para vendedores'],
+  ['MAX_PLAZO','120','Plazo máximo en meses'],
+  ['TASA_MORATORIA','3','% mensual de interés moratorio (se imprime en el contrato)'],
+  ['VENDEDOR_VE_TODO','NO','SI = el vendedor ve clientes/ventas de todos; NO = solo los suyos'],
+  ['BITACORA_MAX','3000','Máximo de renglones que conserva la bitácora'],
+  ['CONTRATO_PLANTILLA', '', 'Plantilla del contrato (usa {{MARCADORES}})']
+];
+
+const PLANTILLA_DEFAULT = [
+'# CONTRATO DE PROMESA DE COMPRAVENTA A PLAZOS',
+'Folio: {{FOLIO}} · {{CIUDAD}}, a {{FECHA_LARGA}}',
+'CONTRATO DE PROMESA DE COMPRAVENTA A PLAZOS DE UN BIEN INMUEBLE QUE CELEBRAN, POR UNA PARTE, **{{EMPRESA_RAZON}}**, REPRESENTADA POR **{{REPRESENTANTE}}**, A QUIEN EN LO SUCESIVO SE LE DENOMINARÁ "EL VENDEDOR", Y POR LA OTRA, **{{CLIENTE_NOMBRE}}**, A QUIEN EN LO SUCESIVO SE LE DENOMINARÁ "EL COMPRADOR", AL TENOR DE LAS SIGUIENTES DECLARACIONES Y CLÁUSULAS:',
+'## DECLARACIONES',
+'I. Declara EL VENDEDOR ser una persona moral con RFC {{EMPRESA_RFC}}, con domicilio en {{EMPRESA_DIRECCION}}, y que cuenta con las facultades y los derechos necesarios para disponer del inmueble objeto de este contrato.',
+'II. Declara EL COMPRADOR ser persona física, mayor de edad, con capacidad legal para contratar, estado civil {{CLIENTE_EDO_CIVIL}}, ocupación {{CLIENTE_OCUPACION}}, CURP {{CLIENTE_CURP}}, RFC {{CLIENTE_RFC}}, clave de elector {{CLIENTE_INE}}, con domicilio para oír y recibir notificaciones en {{CLIENTE_DOMICILIO}}, teléfono {{CLIENTE_TEL}} y correo electrónico {{CLIENTE_EMAIL}}.',
+'III. Declaran ambas partes que se reconocen mutuamente la personalidad con que comparecen y que es su voluntad celebrar el presente contrato.',
+'## CLÁUSULAS',
+'**PRIMERA. OBJETO.** EL VENDEDOR promete vender y EL COMPRADOR promete comprar el lote número {{LOTE}} de la manzana {{MANZANA}} del fraccionamiento "{{FRACC}}", ubicado en {{FRACC_UBICACION}}, municipio de {{MUNICIPIO}}, {{ESTADO}}, con superficie de {{SUPERFICIE}} m² (frente {{FRENTE}} m y fondo {{FONDO}} m).',
+'**SEGUNDA. PRECIO.** El precio total de la operación es de {{PRECIO_TOTAL}} ({{PRECIO_TOTAL_LETRA}}), a razón de {{PRECIO_M2}} por metro cuadrado. Descuento aplicado: {{DESCUENTO}}.',
+'**TERCERA. FORMA DE PAGO.** EL COMPRADOR pagará: a) un enganche de {{ENGANCHE}} ({{ENGANCHE_LETRA}}) a la firma de este contrato; y b) el saldo de {{SALDO_FINANCIADO}} en {{PLAZO}} mensualidades de {{MENSUALIDAD}} ({{MENSUALIDAD_LETRA}}) cada una, pagaderas el día {{DIA_PAGO}} de cada mes, la primera el {{PRIMER_PAGO}} y la última el {{ULTIMO_PAGO}}. Tasa de interés ordinaria anual: {{TASA_ANUAL}}%. El calendario de pagos forma parte de este contrato:',
+'{{TABLA_PAGOS}}',
+'**CUARTA. MORA.** La falta de pago puntual de cualquier mensualidad generará un interés moratorio de {{TASA_MORATORIA}}% mensual sobre el saldo vencido, desde el día siguiente al del vencimiento y hasta su pago total.',
+'**QUINTA. ESCRITURACIÓN.** Liquidado el precio total, EL VENDEDOR se obliga a otorgar la escritura pública de compraventa ante el notario que designe. Los gastos, impuestos y derechos de escrituración serán a cargo de EL COMPRADOR.',
+'**SEXTA. RESCISIÓN.** La falta de pago de tres o más mensualidades consecutivas será causa de rescisión, previo aviso por escrito. En ese caso se aplicará la pena convencional acordada por las partes y se devolverá el remanente de lo pagado conforme a la ley aplicable.',
+'**SÉPTIMA. IMPUESTOS Y SERVICIOS.** Los impuestos prediales y los servicios del lote serán a cargo de EL COMPRADOR a partir de la entrega de la posesión.',
+'**OCTAVA. BENEFICIARIO.** En caso de fallecimiento de EL COMPRADOR, los derechos derivados de este contrato se reconocerán a favor de: {{BENEFICIARIO}}.',
+'**NOVENA. JURISDICCIÓN.** Para la interpretación y cumplimiento de este contrato las partes se someten a las leyes y tribunales de {{CIUDAD}}, y a la competencia de la Procuraduría Federal del Consumidor cuando proceda, renunciando a cualquier otro fuero.',
+'Leído que fue el presente contrato y enteradas las partes de su contenido y alcance, lo firman por duplicado.',
+'{{FIRMAS}}',
+'Asesor de ventas: {{VENDEDOR}}',
+'Modelo genérico: debe ser revisado y adaptado por un abogado antes de usarse.'
+].join('\n');
+
+/* Estado en memoria durante UNA ejecución */
+let _SS = null, _SH = {}, _MEM = {}, _VER = null;
+
+/* ============================== ARRANQUE ================================= */
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('Los Pinos · Venta de terrenos')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover');
+}
+
+function onOpen() {
+  try {
+    SpreadsheetApp.getUi().createMenu('🏡 Inmobiliaria')
+      .addItem('1) Crear / actualizar base de datos', 'setupDatabase')
+      .addItem('2) Activar avisos diarios de abonos', 'instalarTriggers')
+      .addSeparator()
+      .addItem('Restablecer contraseña de administrador', 'restablecerAdmin')
+      .addItem('Cargar datos de ejemplo', 'cargarDatosDemo')
+      .addItem('Limpiar caché', 'limpiarCache')
+      .addToUi();
+  } catch (e) { /* no hay UI (web app / trigger) */ }
+}
+
+/* ===================== INSTALACIÓN: hojas, columnas, formatos =========== */
+function setupDatabase() {
+  soloPropietario_();
+  const ss = ss_(), rep = [];
+  Object.keys(TABLAS).forEach(k => {
+    const T = TABLAS[k], n = T.cols.length;
+    let sh = ss.getSheetByName(T.hoja);
+    if (!sh) { sh = ss.insertSheet(T.hoja); rep.push('Hoja creada: ' + T.hoja); }
+    // Mantener la hoja liviana: solo las columnas necesarias y ~500 filas iniciales
+    if (sh.getMaxColumns() > n) sh.deleteColumns(n + 1, sh.getMaxColumns() - n);
+    if (sh.getMaxColumns() < n) sh.insertColumnsAfter(sh.getMaxColumns(), n - sh.getMaxColumns());
+    if (sh.getMaxRows() > 500 && sh.getLastRow() < 500) sh.deleteRows(501, sh.getMaxRows() - 500);
+    sh.getRange(1, 1, 1, n).setValues([T.cols]).setFontWeight('bold').setFontColor('#ffffff').setBackground(T.color);
+    sh.setFrozenRows(1);
+    sh.setTabColor(T.color);
+    const filas = sh.getMaxRows() - 1;
+    T.cols.forEach((c, i) => {
+      const r = sh.getRange(2, i + 1, filas, 1);
+      if (MONEDA.has(c)) r.setNumberFormat('$#,##0.00');
+      else if (FECHA.has(c)) r.setNumberFormat('yyyy-mm-dd');
+      else if (FECHAHORA.has(c)) r.setNumberFormat('yyyy-mm-dd hh:mm');
+      else if (DEC.has(c)) r.setNumberFormat('#,##0.00');
+      else if (ENT.has(c)) r.setNumberFormat('0');
+      else if (TEXTO.has(c)) r.setNumberFormat('@');
+      const lista = LISTAS[k + '.' + c];
+      if (lista) r.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(lista, true).setAllowInvalid(false).build());
+      sh.setColumnWidth(i + 1, ['Hash','Salt'].indexOf(c) >= 0 ? 90 : (c === 'Valor' || c === 'Detalle' || c === 'Domicilio' || c === 'Descripcion' || c === 'Notas') ? 280 : 120);
+    });
+    sh.getRange(1, 1, 1, n).setWrap(false);
+    try { sh.protect().setWarningOnly(true).setDescription('Base de datos de la app: edita desde la aplicación'); } catch (e) {}
+    _SH[k] = sh;
+  });
+  // Hoja inicial vacía por defecto
+  ['Hoja 1', 'Sheet1', 'Hoja1'].forEach(nm => {
+    const s = ss.getSheetByName(nm);
+    if (s && ss.getSheets().length > 1 && s.getLastRow() <= 1) ss.deleteSheet(s);
+  });
+  // Pimienta secreta (una sola vez)
+  const P = PropertiesService.getScriptProperties();
+  if (!P.getProperty('PEPPER')) P.setProperty('PEPPER', Utilities.getUuid() + Utilities.getUuid());
+  // Parámetros por defecto (no pisa los existentes)
+  const existentes = {};
+  leer_('CFG', false).forEach(r => existentes[r.Clave] = 1);
+  const nuevos = CFG_DEF.filter(d => !existentes[d[0]]).map(d => [d[0], d[0] === 'CONTRATO_PLANTILLA' ? PLANTILLA_DEFAULT : d[1], d[2]]);
+  if (nuevos.length) escribirFilas_('CFG', nuevos);
+  // Administrador inicial
+  let msg = 'Base de datos lista.\n' + rep.join('\n');
+  if (!leer_('USU', false).some(u => u.Rol === 'admin')) {
+    const email = (Session.getEffectiveUser().getEmail() || 'admin@ejemplo.com').toLowerCase();
+    const tmp = passTemp_();
+    crearUsuarioInterno_({ Nombre: 'Administrador', Email: email, Rol: 'admin', Pass: tmp });
+    msg += '\n\nADMINISTRADOR CREADO\nUsuario: ' + email + '\nContraseña temporal: ' + tmp + '\n(se te pedirá cambiarla al entrar)';
+  }
+  limpiarCache();
+  aviso_(msg);
+  return msg;
+}
+
+function instalarTriggers() {
+  soloPropietario_();
+  programarTrigger_();
+  aviso_('Listo: los avisos de abonos se enviarán todos los días a las ' + (+cfg_().HORA_NOTIF || 8) + ':00 (hora del script).');
+}
+
+function programarTrigger_() {
+  ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === 'notificacionesDiarias') ScriptApp.deleteTrigger(t); });
+  const hora = Math.min(23, Math.max(0, +cfg_().HORA_NOTIF || 8));
+  ScriptApp.newTrigger('notificacionesDiarias').timeBased().everyDays(1).atHour(hora).create();
+}
+
+function restablecerAdmin() {
+  soloPropietario_();
+  let objetivo = (Session.getEffectiveUser().getEmail() || '').toLowerCase(), ui = null;
+  try { ui = SpreadsheetApp.getUi(); } catch (e) {}
+  if (ui) {
+    const r = ui.prompt('Restablecer administrador', 'Correo del administrador (vacío = ' + objetivo + '):', ui.ButtonSet.OK_CANCEL);
+    if (r.getSelectedButton() !== ui.Button.OK) return;
+    if (r.getResponseText().trim()) objetivo = r.getResponseText().trim().toLowerCase();
+  }
+  const tmp = passTemp_();
+  lock_(() => {
+    const u = leer_('USU', false).find(x => String(x.Email).toLowerCase() === objetivo);
+    if (u) {
+      const salt = nuevoSalt_();
+      actualizar_('USU', u.ID, { Hash: hashPass_(tmp, salt), Salt: salt, Activo: 'SI', Rol: 'admin', CambiarPass: 'SI' });
+    } else crearUsuarioInterno_({ Nombre: 'Administrador', Email: objetivo, Rol: 'admin', Pass: tmp });
+  });
+  aviso_('Contraseña temporal para ' + objetivo + ':\n' + tmp);
+}
+
+function limpiarCache() {
+  soloPropietario_();
+  ['USU','FRA','LOT','CLI','VEN','CFG'].forEach(t => cacheDel_('T:' + t));
+  bumpVer_(); _MEM = {};
+}
+
+function cargarDatosDemo() {
+  soloPropietario_();
+  lock_(() => {
+    if (leer_('FRA', false).length) throw new Error('Ya hay fraccionamientos; no se cargan datos de ejemplo.');
+    const fid = nextId_('F', 'FRA', 3);
+    insertar_('FRA', { ID: fid, Nombre: 'Valle Dorado', Ubicacion: 'Carretera libre km 12', Municipio: 'Ensenada', Estado: 'Baja California', Descripcion: 'Terrenos con servicios, ideal para casa habitación.', PrecioM2: 850, Estatus: 'Activo', Creado: new Date() });
+    ['1', '2'].forEach(mz => hLotesGenerar_({ rol: 'admin', email: 'sistema' }, { FraccID: fid, Manzana: mz, Desde: 1, Hasta: 12, Frente: 10, Fondo: 20, PrecioM2: 850 }));
+    const cid = nextId_('C', 'CLI', 5);
+    insertar_('CLI', { ID: cid, Nombre: 'María Fernanda López Ruiz', Telefono: '6641234567', Email: '', CURP: '', RFC: '', INE: '', Domicilio: 'Col. Centro, Tijuana', EstadoCivil: 'Soltero(a)', Ocupacion: 'Comerciante', Beneficiario: 'Juan López', VendedorID: '', Notas: 'Cliente de ejemplo', Creado: new Date() });
+  });
+  aviso_('Datos de ejemplo cargados.');
+}
+
+/* ================================ AUTH ==================================== */
+function login(email, pass) {
+  try {
+    email = String(email || '').trim().toLowerCase(); pass = String(pass || '');
+    if (!email || !pass) throw new Error('Ingresa tu correo y contraseña');
+    const c = CacheService.getScriptCache(), kf = 'F:' + email.slice(0, 120);
+    const fallos = +c.get(kf) || 0;
+    if (fallos >= APP.MAX_INTENTOS) throw new Error('Demasiados intentos. Intenta de nuevo en 15 minutos.');
+    const u = leer_('USU', true).find(x => String(x.Email).toLowerCase() === email);
+    const ok = u && u.Activo === 'SI' && cmp_(hashPass_(pass, u.Salt), u.Hash);
+    if (!ok) { c.put(kf, String(fallos + 1), APP.BLOQUEO_SEG); Utilities.sleep(400); throw new Error('Correo o contraseña incorrectos'); }
+    c.remove(kf);
+    const token = crearSesion_(u);
+    try {
+      const r = buscarFila_('USU', u.ID);
+      if (r) sheet_('USU').getRange(r, TABLAS.USU.cols.indexOf('UltimoAcceso') + 1).setValue(new Date());
+    } catch (e) {}
+    return { ok: true, data: { token: token, user: pub_(u), config: cfgPublic_() } };
+  } catch (e) { return { ok: false, error: String(e.message || e) }; }
+}
+
+function logout(token) {
+  try { if (token) CacheService.getScriptCache().remove('S:' + token); } catch (e) {}
+  return { ok: true };
+}
+
+function crearSesion_(u) {
+  const token = Utilities.getUuid() + Utilities.getUuid().replace(/-/g, '');
+  CacheService.getScriptCache().put('S:' + token, JSON.stringify({ id: u.ID, pv: String(u.Hash).slice(0, 12) }), APP.SESION_SEG);
+  return token;
+}
+
+function sesion_(token) {
+  if (!token || typeof token !== 'string' || token.length < 40) throw err_('SESION', 'Sesión no válida');
+  const c = CacheService.getScriptCache(), raw = c.get('S:' + token);
+  if (!raw) throw err_('SESION', 'Tu sesión expiró. Inicia sesión de nuevo.');
+  const s = JSON.parse(raw);
+  const f = leer_('USU', true).find(x => x.ID === s.id);
+  if (!f || f.Activo !== 'SI' || String(f.Hash).slice(0, 12) !== s.pv) throw err_('SESION', 'Sesión no válida');
+  c.put('S:' + token, raw, APP.SESION_SEG); // sesión deslizante
+  return { id: f.ID, nombre: f.Nombre, email: f.Email, rol: f.Rol, token: token };
+}
+
+function pub_(u) { return { id: u.ID, nombre: u.Nombre, email: u.Email, rol: u.Rol, activo: u.Activo, cambiarPass: u.CambiarPass === 'SI', ultimoAcceso: u.UltimoAcceso || '' }; }
+function err_(code, msg) { const e = new Error(msg); e.code = code; return e; }
+
+function hex_(bytes) { return bytes.map(b => ('0' + (b & 255).toString(16)).slice(-2)).join(''); }
+function hashPass_(pass, salt) {
+  const pepper = PropertiesService.getScriptProperties().getProperty('PEPPER') || '';
+  let h = salt + ':' + pass + ':' + pepper;
+  for (let i = 0; i < APP.HASH_ROUNDS; i++) h = hex_(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, h + salt, Utilities.Charset.UTF_8));
+  return h;
+}
+function nuevoSalt_() { return Utilities.getUuid().replace(/-/g, ''); }
+function cmp_(a, b) {
+  a = String(a); b = String(b);
+  if (a.length !== b.length) return false;
+  let r = 0; for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+function passTemp_() {
+  const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const b = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, Utilities.getUuid() + Date.now() + Math.random());
+  let s = ''; for (let i = 0; i < 10; i++) s += abc[(b[i] & 255) % abc.length];
+  return s + (2 + (b[11] & 255) % 8);
+}
+function validarPass_(p) {
+  p = String(p || '');
+  if (p.length < 8) throw new Error('La contraseña debe tener al menos 8 caracteres');
+  if (!/[A-Za-z]/.test(p) || !/\d/.test(p)) throw new Error('La contraseña debe incluir letras y números');
+}
+function crearUsuarioInterno_(o) {
+  const salt = nuevoSalt_(), id = nextId_('U', 'USU', 3);
+  insertar_('USU', { ID: id, Nombre: o.Nombre, Email: String(o.Email).toLowerCase(), Rol: o.Rol, Hash: hashPass_(o.Pass, salt), Salt: salt, Activo: 'SI', CambiarPass: 'SI', UltimoAcceso: '', Creado: new Date() });
+  return id;
+}
+function soloPropietario_() {
+  const a = Session.getActiveUser().getEmail(), e = Session.getEffectiveUser().getEmail();
+  if (!a || a !== e) throw new Error('Solo el propietario del script puede ejecutar esta función.');
+}
+function aviso_(msg) {
+  Logger.log(msg);
+  try { SpreadsheetApp.getUi().alert(msg); } catch (e) {}
+}
+
+/* ============================ DESPACHADOR API ============================= */
+function api(token, accion, p) {
+  try {
+    const u = sesion_(token);
+    const h = HANDLERS[accion];
+    if (!h) throw new Error('Acción no válida');
+    if (h.r.indexOf(u.rol) < 0) throw new Error('No tienes permiso para realizar esta acción');
+    const data = h.w ? lock_(() => h.f(u, p || {})) : h.f(u, p || {});
+    return { ok: true, data: data === undefined ? null : data };
+  } catch (e) {
+    return { ok: false, error: String(e.message || e), code: e.code || '' };
+  }
+}
+
+const HANDLERS = {
+  'sesion.info':     { r: AMBOS, f: hSesionInfo_ },
+  'perfil.pass':     { r: AMBOS, w: true, f: hPerfilPass_ },
+  'dashboard':       { r: AMBOS, f: hDashboard_ },
+  'notif.list':      { r: AMBOS, f: hNotifList_ },
+  'notif.enviar':    { r: ADMIN, f: hNotifEnviar_ },
+  'fracc.list':      { r: AMBOS, f: hFraccList_ },
+  'fracc.save':      { r: ADMIN, w: true, f: hFraccSave_ },
+  'lotes.list':      { r: AMBOS, f: hLotesList_ },
+  'lotes.save':      { r: ADMIN, w: true, f: hLoteSave_ },
+  'lotes.generar':   { r: ADMIN, w: true, f: hLotesGenerar_ },
+  'lotes.precio':    { r: ADMIN, w: true, f: hLotesPrecio_ },
+  'lotes.eliminar':  { r: ADMIN, w: true, f: hLoteEliminar_ },
+  'clientes.list':   { r: AMBOS, f: hClientesList_ },
+  'clientes.save':   { r: AMBOS, w: true, f: hClienteSave_ },
+  'clientes.eliminar': { r: ADMIN, w: true, f: hClienteEliminar_ },
+  'ventas.list':     { r: AMBOS, f: hVentasList_ },
+  'ventas.get':      { r: AMBOS, f: hVentaGet_ },
+  'ventas.crear':    { r: AMBOS, w: true, f: hVentaCrear_ },
+  'ventas.cerrar':   { r: AMBOS, w: true, f: hVentaCerrar_ },
+  'ventas.cancelar': { r: AMBOS, w: true, f: hVentaCancelar_ },
+  'abonos.list':     { r: AMBOS, f: hAbonosList_ },
+  'abonos.pagar':    { r: ADMIN, w: true, f: hAbonoPagar_ },
+  'usuarios.list':   { r: ADMIN, f: hUsuariosList_ },
+  'usuarios.save':   { r: ADMIN, w: true, f: hUsuarioSave_ },
+  'usuarios.reset':  { r: ADMIN, w: true, f: hUsuarioReset_ },
+  'config.get':      { r: ADMIN, f: hConfigGet_ },
+  'config.save':     { r: ADMIN, w: true, f: hConfigSave_ },
+  'cache.limpiar':   { r: ADMIN, f: hCacheLimpiar_ }
+};
+
+/* ============================ CAPA DE DATOS =============================== */
+function ss_() {
+  if (_SS) return _SS;
+  const P = PropertiesService.getScriptProperties(), id = P.getProperty('SS_ID');
+  if (id) { _SS = SpreadsheetApp.openById(id); return _SS; }
+  const a = SpreadsheetApp.getActiveSpreadsheet();
+  if (!a) throw new Error('Script independiente: define la propiedad de script SS_ID con el ID de tu hoja de cálculo.');
+  P.setProperty('SS_ID', a.getId());
+  _SS = a; return a;
+}
+function sheet_(t) {
+  if (_SH[t]) return _SH[t];
+  const s = ss_().getSheetByName(TABLAS[t].hoja);
+  if (!s) throw new Error('Falta la hoja "' + TABLAS[t].hoja + '". Ejecuta setupDatabase().');
+  _SH[t] = s; return s;
+}
+
+function pad_(n, l) { return String(n).padStart(l || 2, '0'); }
+function fmtD_(d) { return (d instanceof Date && !isNaN(d)) ? d.getFullYear() + '-' + pad_(d.getMonth() + 1) + '-' + pad_(d.getDate()) : ''; }
+function fmtDT_(d) { return (d instanceof Date && !isNaN(d)) ? fmtD_(d) + ' ' + pad_(d.getHours()) + ':' + pad_(d.getMinutes()) : ''; }
+function hoy_() { return fmtD_(new Date()); }
+function parseD_(s) {
+  const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2}))?$/);
+  return m ? new Date(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0)) : s;
+}
+function dias_(a, b) { // días de a → b (b - a)
+  const A = String(a).split('-'), B = String(b).split('-');
+  return Math.round((Date.UTC(+B[0], +B[1] - 1, +B[2].slice(0, 2)) - Date.UTC(+A[0], +A[1] - 1, +A[2].slice(0, 2))) / 864e5);
+}
+function sumaDias_(s, n) {
+  const A = s.split('-'), d = new Date(Date.UTC(+A[0], +A[1] - 1, +A[2] + n));
+  return d.getUTCFullYear() + '-' + pad_(d.getUTCMonth() + 1) + '-' + pad_(d.getUTCDate());
+}
+function fechaMes_(base, k, dia) { // base + k meses, en el día indicado (ajustado a fin de mes)
+  const A = String(base).split('-'); let y = +A[0], m = +A[1] - 1 + k;
+  y += Math.floor(m / 12); m = ((m % 12) + 12) % 12;
+  const ult = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+  return y + '-' + pad_(m + 1) + '-' + pad_(Math.min(dia || +A[2], ult));
+}
+function ultimosMeses_(hoy, n) {
+  let y = +hoy.slice(0, 4), m = +hoy.slice(5, 7); const out = [];
+  for (let i = 0; i < n; i++) { out.unshift(y + '-' + pad_(m)); m--; if (m === 0) { m = 12; y--; } }
+  return out;
+}
+function r2_(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100; }
+function num_(v) { const n = Number(String(v == null ? '' : v).replace(/[$,\s]/g, '')); return isFinite(n) ? n : 0; }
+function txt_(v, max) { return String(v == null ? '' : v).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').trim().slice(0, max || 200); }
+function pesos_(n) { return '$' + (+n || 0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function escHtml_(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+/* Normaliza valores de celda → JSON seguro (las fechas viajan como texto) */
+function norm_(c, v) {
+  if (v instanceof Date) return FECHAHORA.has(c) ? fmtDT_(v) : fmtD_(v);
+  if (v === '' || v === null || v === undefined) return '';
+  if (TEXTO.has(c)) return String(v);
+  return v;
+}
+function filaAObj_(t, row) {
+  const cols = TABLAS[t].cols, o = {};
+  for (let i = 0; i < cols.length; i++) o[cols[i]] = norm_(cols[i], row[i]);
+  return o;
+}
+/* Valor de la app → celda (fechas texto → Date; evita inyección de fórmulas) */
+function val_(c, v) {
+  if (v === undefined || v === null) return '';
+  if (typeof v === 'string') {
+    if (v === '') return '';
+    if (FECHA.has(c) || FECHAHORA.has(c)) return parseD_(v);
+    if (!TEXTO.has(c) && /^[=+\-@]/.test(v)) return "'" + v;
+  }
+  return v;
+}
+function aFila_(t, o) { return TABLAS[t].cols.map(c => val_(c, o[c])); }
+
+/* Lee una tabla completa. Con cache=true usa CacheService (formato compacto) */
+function leer_(t, cache) {
+  if (cache && _MEM[t]) return _MEM[t];
+  const cols = TABLAS[t].cols;
+  let filas = cache ? cacheGet_('T:' + t) : null;
+  if (!filas) {
+    const sh = sheet_(t), n = sh.getLastRow() - 1;
+    filas = [];
+    if (n > 0) {
+      sh.getRange(2, 1, n, cols.length).getValues().forEach(r => {
+        if (r[0] === '') return;
+        filas.push(cols.map((c, i) => norm_(c, r[i])));
+      });
+    }
+    if (cache) cachePut_('T:' + t, filas);
+  }
+  const out = filas.map(r => { const o = {}; for (let i = 0; i < cols.length; i++) o[cols[i]] = r[i]; return o; });
+  if (cache) _MEM[t] = out;
+  return out;
+}
+function buscarFila_(t, id, col) {
+  const sh = sheet_(t), last = sh.getLastRow();
+  if (last < 2) return 0;
+  const v = sh.getRange(2, (col || 0) + 1, last - 1, 1).getValues();
+  const s = String(id);
+  for (let i = 0; i < v.length; i++) if (String(v[i][0]) === s) return i + 2;
+  return 0;
+}
+function escribirFilas_(t, filas) {
+  if (!filas.length) return;
+  const sh = sheet_(t), n = TABLAS[t].cols.length, ini = sh.getLastRow() + 1, fin = ini + filas.length - 1, max = sh.getMaxRows();
+  if (fin > max) sh.insertRowsAfter(max, Math.max(fin - max, 200));
+  sh.getRange(ini, 1, filas.length, n).setValues(filas);
+}
+function insertar_(t, o) { escribirFilas_(t, [aFila_(t, o)]); invalidar_(t); }
+function insertarMuchos_(t, objs) { escribirFilas_(t, objs.map(o => aFila_(t, o))); invalidar_(t); }
+function actualizar_(t, id, patch) {
+  const r = buscarFila_(t, id);
+  if (!r) throw new Error('Registro no encontrado: ' + id);
+  const cols = TABLAS[t].cols, rng = sheet_(t).getRange(r, 1, 1, cols.length), cur = rng.getValues()[0];
+  // todas las celdas pasan por val_: evita que un texto que parece fórmula se reinterprete al reescribir la fila
+  cols.forEach((c, i) => { cur[i] = Object.prototype.hasOwnProperty.call(patch, c) ? val_(c, patch[c]) : val_(c, cur[i]); });
+  rng.setValues([cur]);
+  invalidar_(t);
+  return r;
+}
+function borrarFilas_(t, filas) { // filas = números de fila; borra por bloques contiguos, de abajo hacia arriba
+  const sh = sheet_(t), f = filas.slice().sort((a, b) => b - a);
+  let i = 0;
+  while (i < f.length) {
+    let j = i; while (j + 1 < f.length && f[j + 1] === f[j] - 1) j++;
+    sh.deleteRows(f[j], j - i + 1);
+    i = j + 1;
+  }
+  invalidar_(t);
+}
+
+/* Identificadores cortos con contador (se llama dentro de lock) */
+function reservarIds_(pref, t, pad, count) {
+  const P = PropertiesService.getScriptProperties(), k = 'CNT_' + pref;
+  let n = +P.getProperty(k) || 0;
+  if (!n) leer_(t, false).forEach(o => { const m = String(o[TABLAS[t].cols[0]]).match(/(\d+)$/); if (m) n = Math.max(n, +m[1]); });
+  const out = [];
+  for (let i = 0; i < count; i++) { n++; out.push(pref + '-' + pad_(n, pad)); }
+  P.setProperty(k, String(n));
+  return out;
+}
+function nextId_(pref, t, pad) { return reservarIds_(pref, t, pad, 1)[0]; }
+function folio_() {
+  const y = hoy_().slice(0, 4), P = PropertiesService.getScriptProperties(), k = 'CNT_CT_' + y;
+  let n = +P.getProperty(k) || 0;
+  if (!n) leer_('VEN', false).forEach(v => { if (String(v.ID).indexOf('CT-' + y + '-') === 0) n = Math.max(n, +String(v.ID).split('-')[2]); });
+  n++; P.setProperty(k, String(n));
+  return 'CT-' + y + '-' + pad_(n, 4);
+}
+function lock_(fn) {
+  const l = LockService.getScriptLock();
+  l.waitLock(25000);
+  try { return fn(); } finally { l.releaseLock(); }
+}
+function log_(u, acc, det) {
+  try { escribirFilas_('LOG', [[new Date(), (u && (u.email || u.id)) || 'sistema', acc, String(det || '').slice(0, 300)]]); } catch (e) {}
+}
+
+/* ================================ CACHÉ =================================== */
+function cachePut_(k, obj, ttl) {
+  try {
+    const c = CacheService.getScriptCache(), s = JSON.stringify(obj), n = Math.max(1, Math.ceil(s.length / APP.CHUNK)), m = {};
+    for (let i = 0; i < n; i++) m[k + '#' + i] = s.substr(i * APP.CHUNK, APP.CHUNK);
+    m[k + '#n'] = String(n);
+    c.putAll(m, ttl || APP.CACHE_SEG);
+  } catch (e) { /* el caché nunca debe romper la app */ }
+}
+function cacheGet_(k) {
+  try {
+    const c = CacheService.getScriptCache(), n = +c.get(k + '#n');
+    if (!n) return null;
+    const keys = []; for (let i = 0; i < n; i++) keys.push(k + '#' + i);
+    const got = c.getAll(keys); let s = '';
+    for (let i = 0; i < n; i++) { const p = got[k + '#' + i]; if (p == null) return null; s += p; }
+    return JSON.parse(s);
+  } catch (e) { return null; }
+}
+function cacheDel_(k) {
+  try {
+    const c = CacheService.getScriptCache(), n = +c.get(k + '#n') || 0, keys = [k + '#n'];
+    for (let i = 0; i < n; i++) keys.push(k + '#' + i);
+    c.removeAll(keys);
+  } catch (e) {}
+}
+function ver_() {
+  if (_VER) return _VER;
+  const c = CacheService.getScriptCache();
+  let v = c.get('VER');
+  if (!v) { v = String(Date.now()); c.put('VER', v, APP.CACHE_SEG); }
+  return (_VER = v);
+}
+function bumpVer_() { _VER = String(Date.now()); try { CacheService.getScriptCache().put('VER', _VER, APP.CACHE_SEG); } catch (e) {} }
+function invalidar_(t) { delete _MEM[t]; cacheDel_('T:' + t); if (t !== 'LOG' && t !== 'CFG') bumpVer_(); }
+
+/* Configuración */
+function cfg_() {
+  const o = {};
+  CFG_DEF.forEach(d => o[d[0]] = d[0] === 'CONTRATO_PLANTILLA' ? PLANTILLA_DEFAULT : d[1]);
+  leer_('CFG', true).forEach(r => { if (r.Clave) o[r.Clave] = r.Valor; });
+  return o;
+}
+function cfgPublic_() {
+  const c = cfg_(), o = {};
+  ['EMPRESA_NOMBRE','EMPRESA_TEL','EMPRESA_EMAIL','MIN_ENGANCHE_PCT','MAX_DESCUENTO_PCT','MAX_PLAZO','DIAS_AVISO','VENDEDOR_VE_TODO','TASA_MORATORIA'].forEach(k => o[k] = c[k]);
+  return o;
+}
+
+/* =========================== CÁLCULOS FINANCIEROS ========================= */
+function cuota_(capital, n, tasaAnual) {
+  if (n <= 0) return 0;
+  const r = (tasaAnual || 0) / 100 / 12;
+  return r ? r2_(capital * r / (1 - Math.pow(1 + r, -n))) : r2_(capital / n);
+}
+function planFilas_(v, fechaCierre, primero) {
+  const f = [{ VentaID: v.ID, Num: 0, Vence: fechaCierre, Monto: v.Enganche, Pagado: 0, Estatus: 'Pendiente' }];
+  const fin = r2_(v.PrecioFinal - v.Enganche);
+  for (let i = 1; i <= v.Plazo; i++) {
+    let m = v.Mensualidad;
+    if (i === v.Plazo && !v.TasaAnual) m = r2_(fin - v.Mensualidad * (v.Plazo - 1)); // absorbe el redondeo
+    f.push({ VentaID: v.ID, Num: i, Vence: fechaMes_(primero, i - 1, v.DiaPago), Monto: m, Pagado: 0, Estatus: 'Pendiente' });
+  }
+  return f;
+}
+function etiq_(l) { return l && l.ID ? ((l.Manzana ? 'Mz ' + l.Manzana + ' · ' : '') + 'Lt ' + l.Lote) : ''; }
+function mapas_() {
+  const m = { cli: {}, lot: {}, fra: {}, usu: {} };
+  leer_('CLI', true).forEach(x => m.cli[x.ID] = x);
+  leer_('LOT', true).forEach(x => m.lot[x.ID] = x);
+  leer_('FRA', true).forEach(x => m.fra[x.ID] = x);
+  leer_('USU', true).forEach(x => m.usu[x.ID] = x);
+  return m;
+}
+function veTodo_(u) { return u.rol === 'admin' || cfg_().VENDEDOR_VE_TODO === 'SI'; }
+function enriV_(v, M) {
+  const c = M.cli[v.ClienteID] || {}, l = M.lot[v.LoteID] || {}, f = M.fra[l.FraccID] || {}, s = M.usu[v.VendedorID] || {};
+  return Object.assign({}, v, { Cliente: c.Nombre || '(eliminado)', Tel: c.Telefono || '', Lote: etiq_(l), Fracc: f.Nombre || '', FraccID: l.FraccID || '', Area: l.Area || 0, Vendedor: s.Nombre || '' });
+}
+function ventaFresca_(id) {
+  const v = leer_('VEN', false).find(x => x.ID === id);
+  if (!v) throw new Error('Contrato no encontrado');
+  return v;
+}
+function puedeVerVenta_(u, v) { return veTodo_(u) || v.VendedorID === u.id; }
+
+/* Abonos de una venta (búsqueda rápida con TextFinder) */
+function abonosDeVenta_(id) {
+  const sh = sheet_('ABO'), last = sh.getLastRow(), n = TABLAS.ABO.cols.length;
+  if (last < 2) return [];
+  const cells = sh.getRange(2, 1, last - 1, 1).createTextFinder(id).matchEntireCell(true).matchCase(true).findAll();
+  if (!cells.length) return [];
+  const rows = cells.map(c => c.getRow()).sort((a, b) => a - b), a = rows[0], b = rows[rows.length - 1];
+  const out = [];
+  sh.getRange(a, 1, b - a + 1, n).getValues().forEach((r, i) => { if (String(r[0]) === id) out.push({ row: a + i, o: filaAObj_('ABO', r) }); });
+  return out;
+}
+/* Todos los abonos como arreglos normalizados [VentaID,Num,Vence,Monto,Pagado,FechaPago,Metodo,Ref,Estatus,UltAviso,Usuario] */
+function leerAbonos_() {
+  const sh = sheet_('ABO'), n = sh.getLastRow() - 1;
+  if (n < 1) return [];
+  const out = [];
+  sh.getRange(2, 1, n, TABLAS.ABO.cols.length).getValues().forEach(r => {
+    if (r[0] === '') return;
+    out.push([String(r[0]), +r[1], fmtD_(r[2]), +r[3] || 0, +r[4] || 0, fmtD_(r[5]), r[6], r[7], r[8], fmtD_(r[9]), r[10]]);
+  });
+  return out;
+}
+/* Abonos pendientes con vencimiento ≤ hoy + ventana (vencidos + próximos) — se cachea */
+function abVentana_() {
+  const hoy = hoy_(), k = 'ABW:' + hoy + ':' + ver_(), c = cacheGet_(k);
+  if (c) return c;
+  const lim = sumaDias_(hoy, APP.VENTANA_DIAS), out = [];
+  leerAbonos_().forEach(a => { if (a[8] !== 'Pagado' && a[2] && a[2] <= lim) out.push([a[0], a[1], a[2], a[3], a[4], a[8]]); });
+  cachePut_(k, out, 600);
+  return out;
+}
+function abVentanaEnriq_(u) {
+  const hoy = hoy_(), M = mapas_(), vm = {}, todo = veTodo_(u);
+  leer_('VEN', true).forEach(v => { if (todo || v.VendedorID === u.id) vm[v.ID] = v; });
+  const out = [];
+  abVentana_().forEach(a => {
+    const v = vm[a[0]]; if (!v) return;
+    const c = M.cli[v.ClienteID] || {}, l = M.lot[v.LoteID] || {}, f = M.fra[l.FraccID] || {};
+    out.push({ VentaID: a[0], Num: a[1], Vence: a[2], Monto: a[3], Pagado: a[4], Pendiente: r2_(a[3] - a[4]), Estatus: a[5], Dias: dias_(hoy, a[2]), Plazo: v.Plazo, ClienteID: v.ClienteID, Cliente: c.Nombre || '', Tel: c.Telefono || '', Lote: etiq_(l), Fracc: f.Nombre || '' });
+  });
+  return out.sort((a, b) => a.Vence < b.Vence ? -1 : a.Vence > b.Vence ? 1 : 0);
+}
+
+/* ============================== HANDLERS ================================= */
+function hSesionInfo_(u) {
+  const f = leer_('USU', true).find(x => x.ID === u.id);
+  return { user: pub_(f), config: cfgPublic_() };
+}
+
+function hPerfilPass_(u, p) {
+  const f = leer_('USU', false).find(x => x.ID === u.id);
+  if (!cmp_(hashPass_(String(p.actual || ''), f.Salt), f.Hash)) throw new Error('La contraseña actual no es correcta');
+  validarPass_(p.nueva);
+  if (p.nueva === p.actual) throw new Error('La nueva contraseña debe ser distinta');
+  const salt = nuevoSalt_(), hash = hashPass_(p.nueva, salt);
+  actualizar_('USU', u.id, { Hash: hash, Salt: salt, CambiarPass: 'NO' });
+  CacheService.getScriptCache().remove('S:' + u.token);
+  const token = crearSesion_({ ID: u.id, Hash: hash });
+  log_(u, 'PASSWORD', 'Cambio de contraseña');
+  return { token: token };
+}
+
+/* ---------- Fraccionamientos y lotes ---------- */
+function hFraccList_() {
+  const st = {};
+  leer_('LOT', true).forEach(l => {
+    const s = st[l.FraccID] || (st[l.FraccID] = { t: 0, d: 0, a: 0, v: 0 });
+    s.t++; if (l.Estatus === 'Disponible') s.d++; else if (l.Estatus === 'Apartado') s.a++; else s.v++;
+  });
+  return leer_('FRA', true).map(f => Object.assign({}, f, { stats: st[f.ID] || { t: 0, d: 0, a: 0, v: 0 } }));
+}
+function hFraccSave_(u, p) {
+  const nombre = txt_(p.Nombre, 80); if (nombre.length < 3) throw new Error('El nombre del fraccionamiento es obligatorio');
+  const pm2 = r2_(num_(p.PrecioM2)); if (pm2 <= 0) throw new Error('Captura el precio base por m²');
+  const d = { Nombre: nombre, Ubicacion: txt_(p.Ubicacion, 200), Municipio: txt_(p.Municipio, 80), Estado: txt_(p.Estado, 40), Descripcion: txt_(p.Descripcion, 500), PrecioM2: pm2, Estatus: p.Estatus === 'Inactivo' ? 'Inactivo' : 'Activo' };
+  if (leer_('FRA', false).some(f => f.ID !== p.ID && String(f.Nombre).toLowerCase() === nombre.toLowerCase())) throw new Error('Ya existe un fraccionamiento con ese nombre');
+  if (p.ID) { actualizar_('FRA', p.ID, d); log_(u, 'FRACC.EDITAR', p.ID + ' ' + nombre); return { ID: p.ID }; }
+  d.ID = nextId_('F', 'FRA', 3); d.Creado = new Date();
+  insertar_('FRA', d); log_(u, 'FRACC.NUEVO', d.ID + ' ' + nombre);
+  return { ID: d.ID };
+}
+function hLotesList_(u, p) { return leer_('LOT', true).filter(l => l.FraccID === p.FraccID); }
+
+function hLoteSave_(u, p) {
+  const fra = leer_('FRA', false).find(f => f.ID === p.FraccID); if (!fra) throw new Error('Fraccionamiento no encontrado');
+  const mz = txt_(p.Manzana, 20), lt = txt_(p.Lote, 20); if (!lt) throw new Error('El número de lote es obligatorio');
+  const lots = leer_('LOT', false);
+  if (lots.some(l => l.ID !== p.ID && l.FraccID === fra.ID && String(l.Manzana) === mz && String(l.Lote) === lt)) throw new Error('Ya existe ese lote en esa manzana');
+  if (p.ID) {
+    const cur = lots.find(l => l.ID === p.ID); if (!cur) throw new Error('Lote no encontrado');
+    if (cur.Estatus !== 'Disponible') { actualizar_('LOT', p.ID, { Notas: txt_(p.Notas, 300) }); return { ID: p.ID, aviso: 'Lote apartado/vendido: solo se actualizaron las notas.' }; }
+  }
+  const frente = num_(p.Frente), fondo = num_(p.Fondo), area = r2_(num_(p.Area) || frente * fondo);
+  if (area <= 0) throw new Error('Captura frente y fondo, o la superficie');
+  const pm2 = r2_(num_(p.PrecioM2) || fra.PrecioM2); if (pm2 <= 0) throw new Error('Precio por m² inválido');
+  const d = { FraccID: fra.ID, Manzana: mz, Lote: lt, Frente: frente, Fondo: fondo, Area: area, PrecioM2: pm2, Precio: r2_(area * pm2), Notas: txt_(p.Notas, 300) };
+  if (p.ID) { actualizar_('LOT', p.ID, d); log_(u, 'LOTE.EDITAR', p.ID); return { ID: p.ID }; }
+  d.ID = nextId_('L', 'LOT', 5); d.Estatus = 'Disponible'; d.VentaID = '';
+  insertar_('LOT', d); log_(u, 'LOTE.NUEVO', d.ID + ' ' + fra.Nombre + ' ' + mz + '/' + lt);
+  return { ID: d.ID };
+}
+function hLotesGenerar_(u, p) {
+  const fra = leer_('FRA', false).find(f => f.ID === p.FraccID); if (!fra) throw new Error('Fraccionamiento no encontrado');
+  const desde = Math.round(num_(p.Desde)), hasta = Math.round(num_(p.Hasta));
+  if (desde < 0 || hasta < desde) throw new Error('Rango de lotes inválido');
+  if (hasta - desde + 1 > 500) throw new Error('Máximo 500 lotes por operación');
+  const frente = num_(p.Frente), fondo = num_(p.Fondo), area = r2_(num_(p.Area) || frente * fondo);
+  if (area <= 0) throw new Error('Captura frente y fondo');
+  const pm2 = r2_(num_(p.PrecioM2) || fra.PrecioM2), mz = txt_(p.Manzana, 20);
+  const existentes = {};
+  leer_('LOT', false).forEach(l => { if (l.FraccID === fra.ID) existentes[l.Manzana + '|' + l.Lote] = 1; });
+  const nuevos = [];
+  for (let n = desde; n <= hasta; n++) if (!existentes[mz + '|' + n]) nuevos.push(n);
+  if (!nuevos.length) throw new Error('Todos esos lotes ya existen');
+  const ids = reservarIds_('L', 'LOT', 5, nuevos.length);
+  insertarMuchos_('LOT', nuevos.map((n, i) => ({ ID: ids[i], FraccID: fra.ID, Manzana: mz, Lote: String(n), Frente: frente, Fondo: fondo, Area: area, PrecioM2: pm2, Precio: r2_(area * pm2), Estatus: 'Disponible', VentaID: '', Notas: '' })));
+  log_(u, 'LOTES.GENERAR', fra.Nombre + ' Mz ' + mz + ' ' + desde + '-' + hasta);
+  return { creados: nuevos.length, omitidos: (hasta - desde + 1) - nuevos.length };
+}
+function hLotesPrecio_(u, p) {
+  const pm2 = r2_(num_(p.PrecioM2)); if (pm2 <= 0) throw new Error('Precio por m² inválido');
+  const fra = leer_('FRA', false).find(f => f.ID === p.FraccID); if (!fra) throw new Error('Fraccionamiento no encontrado');
+  const sh = sheet_('LOT'), n = sh.getLastRow() - 1; let cont = 0;
+  if (n > 0) {
+    const C = TABLAS.LOT.cols, iF = C.indexOf('FraccID'), iE = C.indexOf('Estatus'), iA = C.indexOf('Area'), iP = C.indexOf('PrecioM2'), iT = C.indexOf('Precio');
+    const vals = sh.getRange(2, 1, n, C.length).getValues();
+    vals.forEach(r => { if (String(r[iF]) === fra.ID && r[iE] === 'Disponible') { r[iP] = pm2; r[iT] = r2_(r[iA] * pm2); cont++; } });
+    sh.getRange(2, iP + 1, n, 2).setValues(vals.map(r => [r[iP], r[iT]]));
+  }
+  actualizar_('FRA', fra.ID, { PrecioM2: pm2 });
+  invalidar_('LOT');
+  log_(u, 'LOTES.PRECIO', fra.Nombre + ' → ' + pm2 + '/m² (' + cont + ' lotes)');
+  return { actualizados: cont };
+}
+function hLoteEliminar_(u, p) {
+  const l = leer_('LOT', false).find(x => x.ID === p.ID); if (!l) throw new Error('Lote no encontrado');
+  if (l.Estatus !== 'Disponible') throw new Error('Solo se pueden eliminar lotes disponibles');
+  borrarFilas_('LOT', [buscarFila_('LOT', p.ID)]);
+  log_(u, 'LOTE.ELIMINAR', p.ID);
+  return true;
+}
+
+/* ---------- Clientes ---------- */
+function hClientesList_(u) {
+  const M = { usu: {} }; leer_('USU', true).forEach(x => M.usu[x.ID] = x);
+  return leer_('CLI', true).filter(c => veTodo_(u) || c.VendedorID === u.id).map(c => Object.assign({}, c, { Vendedor: (M.usu[c.VendedorID] || {}).Nombre || '' }));
+}
+function hClienteSave_(u, p) {
+  const nombre = txt_(p.Nombre, 120); if (nombre.length < 3) throw new Error('El nombre del cliente es obligatorio');
+  const tel = txt_(p.Telefono, 25).replace(/[^\d+()\-\s]/g, ''); if (tel.replace(/\D/g, '').length < 8) throw new Error('Captura un teléfono válido (mínimo 8 dígitos)');
+  const email = txt_(p.Email, 120).toLowerCase(); if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('El correo electrónico no es válido');
+  const curp = txt_(p.CURP, 18).toUpperCase(), rfc = txt_(p.RFC, 13).toUpperCase();
+  const todos = leer_('CLI', false);
+  if (curp && todos.some(c => c.ID !== p.ID && c.CURP === curp)) throw new Error('Ya existe un cliente con esa CURP');
+  const d = { Nombre: nombre, Telefono: tel, Email: email, CURP: curp, RFC: rfc, INE: txt_(p.INE, 20).toUpperCase(), Domicilio: txt_(p.Domicilio, 250), EstadoCivil: txt_(p.EstadoCivil, 30), Ocupacion: txt_(p.Ocupacion, 80), Beneficiario: txt_(p.Beneficiario, 120), Notas: txt_(p.Notas, 300) };
+  if (p.ID) {
+    const cur = todos.find(c => c.ID === p.ID); if (!cur) throw new Error('Cliente no encontrado');
+    if (u.rol !== 'admin' && cur.VendedorID !== u.id) throw new Error('Solo puedes editar tus propios clientes');
+    actualizar_('CLI', p.ID, d); log_(u, 'CLIENTE.EDITAR', p.ID + ' ' + nombre); return { ID: p.ID };
+  }
+  d.ID = nextId_('C', 'CLI', 5); d.VendedorID = u.id; d.Creado = new Date();
+  insertar_('CLI', d); log_(u, 'CLIENTE.NUEVO', d.ID + ' ' + nombre);
+  return { ID: d.ID };
+}
+function hClienteEliminar_(u, p) {
+  if (leer_('VEN', false).some(v => v.ClienteID === p.ID)) throw new Error('El cliente tiene contratos; no se puede eliminar');
+  const r = buscarFila_('CLI', p.ID); if (!r) throw new Error('Cliente no encontrado');
+  borrarFilas_('CLI', [r]); log_(u, 'CLIENTE.ELIMINAR', p.ID);
+  return true;
+}
+
+/* ---------- Ventas / contratos ---------- */
+function hVentasList_(u, p) {
+  const M = mapas_();
+  return leer_('VEN', true).filter(v => puedeVerVenta_(u, v) && (!p.Estatus || v.Estatus === p.Estatus)).map(v => enriV_(v, M)).sort((a, b) => a.ID < b.ID ? 1 : -1);
+}
+function hVentaGet_(u, p) {
+  const v = ventaFresca_(p.ID); if (!puedeVerVenta_(u, v)) throw new Error('No tienes acceso a este contrato');
+  const M = mapas_(), ev = enriV_(v, M), l = M.lot[v.LoteID] || {}, f = M.fra[l.FraccID] || {}, c = cfg_();
+  return {
+    venta: ev, cliente: M.cli[v.ClienteID] || {}, lote: l, fracc: f,
+    abonos: abonosDeVenta_(v.ID).map(x => x.o),
+    empresa: { nombre: c.EMPRESA_NOMBRE, razon: c.EMPRESA_RAZON, rfc: c.EMPRESA_RFC, direccion: c.EMPRESA_DIRECCION, representante: c.REPRESENTANTE, ciudad: c.CIUDAD, tel: c.EMPRESA_TEL, email: c.EMPRESA_EMAIL, moratoria: c.TASA_MORATORIA },
+    plantilla: c.CONTRATO_PLANTILLA || PLANTILLA_DEFAULT
+  };
+}
+function hVentaCrear_(u, p) {
+  const cfg = cfg_(), adm = u.rol === 'admin';
+  const cli = leer_('CLI', false).find(c => c.ID === p.ClienteID); if (!cli) throw new Error('Selecciona un cliente');
+  if (!adm && !veTodo_(u) && cli.VendedorID !== u.id) throw new Error('Ese cliente no es tuyo');
+  const lot = leer_('LOT', false).find(l => l.ID === p.LoteID); if (!lot) throw new Error('Selecciona un lote');
+  if (lot.Estatus !== 'Disponible') throw new Error('El lote ya no está disponible');
+  const fra = leer_('FRA', false).find(f => f.ID === lot.FraccID);
+  if (!fra || fra.Estatus !== 'Activo') throw new Error('El fraccionamiento no está activo');
+  const precio = lot.Precio, desc = r2_(num_(p.Descuento));
+  if (desc < 0 || desc >= precio) throw new Error('Descuento inválido');
+  const maxDesc = +cfg.MAX_DESCUENTO_PCT || 0;
+  if (!adm && desc > r2_(precio * maxDesc / 100)) throw new Error('El descuento máximo para vendedores es ' + maxDesc + '% (' + pesos_(precio * maxDesc / 100) + ')');
+  const pf = r2_(precio - desc);
+  const plazo = Math.round(num_(p.Plazo)), maxPlazo = +cfg.MAX_PLAZO || 120;
+  if (plazo < 0 || plazo > maxPlazo) throw new Error('El plazo debe estar entre 0 y ' + maxPlazo + ' meses');
+  let eng = r2_(num_(p.Enganche));
+  if (plazo === 0) eng = pf;
+  if (eng <= 0 || eng > pf) throw new Error('El enganche debe ser mayor a 0 y no exceder el precio');
+  if (plazo > 0 && eng >= pf) throw new Error('Si el enganche cubre todo el precio usa plazo 0 (contado)');
+  const minEng = +cfg.MIN_ENGANCHE_PCT || 0;
+  if (!adm && plazo > 0 && eng < r2_(pf * minEng / 100)) throw new Error('El enganche mínimo es ' + minEng + '% (' + pesos_(pf * minEng / 100) + ')');
+  const tasa = Math.min(100, Math.max(0, num_(p.TasaAnual)));
+  const dia = Math.min(28, Math.max(1, Math.round(num_(p.DiaPago) || 5)));
+  const primero = plazo > 0 ? (/^\d{4}-\d{2}-\d{2}$/.test(p.PrimerPago || '') ? p.PrimerPago : fechaMes_(hoy_(), 1, dia)) : '';
+  const id = folio_();
+  insertar_('VEN', { ID: id, Fecha: hoy_(), ClienteID: cli.ID, LoteID: lot.ID, VendedorID: u.id, Descuento: desc, PrecioFinal: pf, Enganche: eng, Plazo: plazo, TasaAnual: tasa, Mensualidad: plazo ? cuota_(pf - eng, plazo, tasa) : 0, DiaPago: dia, PrimerPago: primero, Estatus: 'Contrato', Pagado: 0, Saldo: pf, Notas: txt_(p.Notas, 300) });
+  actualizar_('LOT', lot.ID, { Estatus: 'Apartado', VentaID: id });
+  log_(u, 'CONTRATO.NUEVO', id + ' ' + cli.Nombre + ' ' + etiq_(lot) + ' ' + pesos_(pf));
+  return { ID: id };
+}
+function hVentaCerrar_(u, p) {
+  const v = ventaFresca_(p.ID);
+  if (!puedeVerVenta_(u, v) || (u.rol !== 'admin' && v.VendedorID !== u.id)) throw new Error('No tienes acceso a este contrato');
+  if (v.Estatus !== 'Contrato') throw new Error('Este contrato ya fue cerrado o cancelado');
+  const hoy = hoy_();
+  let primero = v.PrimerPago;
+  if (v.Plazo > 0 && (!primero || primero <= hoy)) primero = fechaMes_(hoy, 1, v.DiaPago);
+  const filas = planFilas_(v, hoy, primero);
+  if (p.EnganchePagado) Object.assign(filas[0], { Pagado: v.Enganche, FechaPago: hoy, Metodo: txt_(p.Metodo, 30) || 'Efectivo', Referencia: txt_(p.Referencia, 60), Estatus: 'Pagado', Usuario: u.id });
+  insertarMuchos_('ABO', filas);
+  const total = r2_(filas.reduce((s, f) => s + f.Monto, 0)), pagado = r2_(filas.reduce((s, f) => s + (f.Pagado || 0), 0)), saldo = r2_(total - pagado);
+  actualizar_('VEN', v.ID, { Estatus: saldo <= 0.004 ? 'Liquidada' : 'Activa', PrimerPago: v.Plazo > 0 ? primero : '', Pagado: pagado, Saldo: saldo });
+  actualizar_('LOT', v.LoteID, { Estatus: 'Vendido' });
+  log_(u, 'VENTA.CERRAR', v.ID + (p.EnganchePagado ? ' enganche cobrado ' + pesos_(v.Enganche) : ''));
+  return { ID: v.ID };
+}
+function hVentaCancelar_(u, p) {
+  const v = ventaFresca_(p.ID), adm = u.rol === 'admin';
+  if (v.Estatus === 'Cancelada') throw new Error('El contrato ya está cancelado');
+  if (!adm && (v.VendedorID !== u.id || v.Estatus !== 'Contrato')) throw new Error('Solo puedes cancelar tus contratos que aún no se cierran');
+  const motivo = txt_(p.Motivo, 150); if (!motivo) throw new Error('Escribe el motivo de la cancelación');
+  const pend = abonosDeVenta_(v.ID).filter(x => x.o.Estatus === 'Pendiente').map(x => x.row);
+  if (pend.length) borrarFilas_('ABO', pend);          // conserva solo el historial de pagos hechos
+  actualizar_('VEN', v.ID, { Estatus: 'Cancelada', Saldo: 0, Notas: txt_((v.Notas ? v.Notas + ' | ' : '') + 'CANCELADO ' + hoy_() + ': ' + motivo, 300) });
+  actualizar_('LOT', v.LoteID, { Estatus: 'Disponible', VentaID: '' });
+  log_(u, 'CONTRATO.CANCELAR', v.ID + ' ' + motivo);
+  return true;
+}
+
+/* ---------- Cobranza ---------- */
+function hAbonosList_(u, p) {
+  const f = p.filtro || 'vencidos', dias = +p.dias || 7, q = txt_(p.q, 60).toLowerCase();
+  let lista = abVentanaEnriq_(u);
+  if (f === 'vencidos') lista = lista.filter(a => a.Dias < 0);
+  else if (f === 'hoy') lista = lista.filter(a => a.Dias === 0);
+  else lista = lista.filter(a => a.Dias >= 0 && a.Dias <= dias);
+  if (q) lista = lista.filter(a => (a.Cliente + ' ' + a.VentaID + ' ' + a.Lote + ' ' + a.Fracc).toLowerCase().indexOf(q) >= 0);
+  return { total: lista.length, monto: r2_(lista.reduce((s, a) => s + a.Pendiente, 0)), items: lista.slice(0, 500) };
+}
+function hAbonoPagar_(u, p) {
+  const v = ventaFresca_(p.VentaID);
+  if (v.Estatus !== 'Activa') throw new Error('El contrato no está activo');
+  const monto = r2_(num_(p.Monto)); if (monto <= 0) throw new Error('Captura un monto válido');
+  const fecha = /^\d{4}-\d{2}-\d{2}$/.test(p.Fecha || '') ? p.Fecha : hoy_();
+  const ab = abonosDeVenta_(v.ID), idx = ab.findIndex(x => x.o.Num === Math.round(num_(p.Num)));
+  if (idx < 0) throw new Error('Abono no encontrado');
+  const saldoDesde = r2_(ab.slice(idx).reduce((s, x) => s + (x.o.Monto - x.o.Pagado), 0));
+  if (monto > saldoDesde + 0.009) throw new Error('El monto excede lo pendiente desde este abono (' + pesos_(saldoDesde) + ')');
+  const sh = sheet_('ABO'), n = TABLAS.ABO.cols.length, aplicados = [];
+  let resto = monto;
+  for (let i = idx; i < ab.length && resto > 0.004; i++) {
+    const o = ab[i].o, deuda = r2_(o.Monto - o.Pagado);
+    if (deuda <= 0.004) continue;
+    const ap = Math.min(deuda, resto);
+    o.Pagado = r2_(o.Pagado + ap); resto = r2_(resto - ap);
+    o.FechaPago = fecha; o.Metodo = txt_(p.Metodo, 30) || 'Efectivo'; o.Referencia = txt_(p.Referencia, 60); o.Usuario = u.id;
+    o.Estatus = o.Pagado >= o.Monto - 0.004 ? 'Pagado' : 'Parcial';
+    sh.getRange(ab[i].row, 1, 1, n).setValues([aFila_('ABO', o)]);
+    aplicados.push({ Num: o.Num, Aplicado: ap, Estatus: o.Estatus });
+  }
+  const pagado = r2_(ab.reduce((s, x) => s + x.o.Pagado, 0)), total = r2_(ab.reduce((s, x) => s + x.o.Monto, 0)), saldo = r2_(total - pagado);
+  actualizar_('VEN', v.ID, { Pagado: pagado, Saldo: saldo, Estatus: saldo <= 0.004 ? 'Liquidada' : 'Activa' });
+  invalidar_('ABO');
+  log_(u, 'ABONO', v.ID + ' ' + pesos_(monto) + ' ' + (p.Metodo || '') + ' ' + (p.Referencia || ''));
+  const M = mapas_(), e = enriV_(v, M);
+  return { recibo: { Folio: v.ID, Cliente: e.Cliente, Lote: e.Lote, Fracc: e.Fracc, Monto: monto, Fecha: fecha, Metodo: txt_(p.Metodo, 30) || 'Efectivo', Referencia: txt_(p.Referencia, 60), Aplicados: aplicados, Saldo: saldo, Cobro: u.nombre }, liquidada: saldo <= 0.004 };
+}
+
+/* ---------- Usuarios ---------- */
+function hUsuariosList_() { return leer_('USU', true).map(pub_); }
+function hUsuarioSave_(u, p) {
+  const nombre = txt_(p.Nombre, 80), email = txt_(p.Email, 120).toLowerCase();
+  if (nombre.length < 3) throw new Error('El nombre es obligatorio');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('Correo no válido');
+  const rol = p.Rol === 'admin' ? 'admin' : 'vendedor', activo = p.Activo === 'NO' ? 'NO' : 'SI';
+  const todos = leer_('USU', false);
+  if (todos.some(x => x.ID !== p.ID && String(x.Email).toLowerCase() === email)) throw new Error('Ya existe un usuario con ese correo');
+  if (p.ID) {
+    const cur = todos.find(x => x.ID === p.ID); if (!cur) throw new Error('Usuario no encontrado');
+    if (cur.ID === u.id && (rol !== 'admin' || activo !== 'SI')) throw new Error('No puedes quitarte el rol de administrador ni desactivarte');
+    if (cur.Rol === 'admin' && (rol !== 'admin' || activo !== 'SI') && todos.filter(x => x.Rol === 'admin' && x.Activo === 'SI' && x.ID !== cur.ID).length === 0) throw new Error('Debe quedar al menos un administrador activo');
+    actualizar_('USU', p.ID, { Nombre: nombre, Email: email, Rol: rol, Activo: activo });
+    log_(u, 'USUARIO.EDITAR', p.ID + ' ' + email + ' ' + rol + ' ' + activo);
+    return { ID: p.ID };
+  }
+  const tmp = p.Password ? String(p.Password) : passTemp_();
+  validarPass_(tmp);
+  const id = crearUsuarioInterno_({ Nombre: nombre, Email: email, Rol: rol, Pass: tmp });
+  log_(u, 'USUARIO.NUEVO', id + ' ' + email + ' ' + rol);
+  return { ID: id, tempPass: tmp };
+}
+function hUsuarioReset_(u, p) {
+  const cur = leer_('USU', false).find(x => x.ID === p.ID); if (!cur) throw new Error('Usuario no encontrado');
+  const tmp = passTemp_(), salt = nuevoSalt_();
+  actualizar_('USU', cur.ID, { Hash: hashPass_(tmp, salt), Salt: salt, CambiarPass: 'SI' });
+  CacheService.getScriptCache().remove('F:' + String(cur.Email).toLowerCase().slice(0, 120));
+  log_(u, 'USUARIO.RESET', cur.ID);
+  return { tempPass: tmp };
+}
+
+/* ---------- Configuración ---------- */
+function hConfigGet_() { return cfg_(); }
+function hConfigSave_(u, p) {
+  const permitidas = {}; CFG_DEF.forEach(d => permitidas[d[0]] = d);
+  const NUMS = ['DIAS_AVISO','HORA_NOTIF','MIN_ENGANCHE_PCT','MAX_DESCUENTO_PCT','MAX_PLAZO','TASA_MORATORIA','BITACORA_MAX'];
+  const antes = cfg_().HORA_NOTIF, existe = {};
+  leer_('CFG', false).forEach(r => existe[r.Clave] = 1);
+  Object.keys(p.valores || {}).forEach(k => {
+    if (!permitidas[k]) return;
+    let v = p.valores[k];
+    if (NUMS.indexOf(k) >= 0) { v = num_(v); if (v < 0) throw new Error('Valor inválido en ' + k); }
+    else if (k === 'AVISO_CLIENTE' || k === 'VENDEDOR_VE_TODO') v = v === 'SI' ? 'SI' : 'NO';
+    else v = txt_(v, k === 'CONTRATO_PLANTILLA' ? 40000 : 250);
+    if (existe[k]) actualizar_('CFG', k, { Valor: v });
+    else insertar_('CFG', { Clave: k, Valor: v, Descripcion: permitidas[k][2] });
+  });
+  invalidar_('CFG');
+  if (String(cfg_().HORA_NOTIF) !== String(antes)) { try { programarTrigger_(); } catch (e) {} }
+  log_(u, 'CONFIG', 'Parámetros actualizados');
+  return cfg_();
+}
+function hCacheLimpiar_(u) {
+  ['USU','FRA','LOT','CLI','VEN','CFG'].forEach(t => { delete _MEM[t]; cacheDel_('T:' + t); });
+  bumpVer_();
+  return true;
+}
+
+/* ================================ DASHBOARD =============================== */
+function hDashboard_(u) {
+  const hoy = hoy_(), key = 'DASH:' + u.rol + ':' + (u.rol === 'admin' ? '*' : u.id) + ':' + hoy + ':' + ver_(), cc = cacheGet_(key);
+  if (cc) return cc;
+  const cfg = cfg_(), todo = veTodo_(u), M = mapas_();
+  const ventas = leer_('VEN', true).filter(v => todo || v.VendedorID === u.id), mios = {};
+  ventas.forEach(v => mios[v.ID] = v);
+  const mesAct = hoy.slice(0, 7), anio = hoy.slice(0, 4), meses = ultimosMeses_(hoy, 6);
+  const vm = {}, cm = {};
+  meses.forEach(k => { vm[k] = { m: k, n: 0, monto: 0 }; cm[k] = { m: k, monto: 0 }; });
+  const est = { Contrato: 0, Activa: 0, Liquidada: 0, Cancelada: 0 }, porVend = {};
+  let cartera = 0, mesN = 0, mesMonto = 0, anioN = 0, anioMonto = 0;
+  ventas.forEach(v => {
+    est[v.Estatus] = (est[v.Estatus] || 0) + 1;
+    if (v.Estatus === 'Activa' || v.Estatus === 'Liquidada') {
+      const f = v.Fecha || '', mk = f.slice(0, 7);
+      if (vm[mk]) { vm[mk].n++; vm[mk].monto += v.PrecioFinal; }
+      if (mk === mesAct) { mesN++; mesMonto += v.PrecioFinal; }
+      if (f.slice(0, 4) === anio) { anioN++; anioMonto += v.PrecioFinal; const p = porVend[v.VendedorID] || (porVend[v.VendedorID] = { n: 0, monto: 0 }); p.n++; p.monto += v.PrecioFinal; }
+    }
+    if (v.Estatus === 'Activa') cartera += v.Saldo;
+  });
+  // Cobranza (un solo recorrido de Abonos)
+  const prevKey = meses[meses.length - 2];
+  let vencM = 0, vencN = 0, p7M = 0, p7N = 0;
+  const morosos = {}, prox = [];
+  leerAbonos_().forEach(a => {
+    const v = mios[a[0]]; if (!v) return;
+    if (a[4] > 0 && a[5]) { const mk = a[5].slice(0, 7); if (cm[mk]) cm[mk].monto += a[4]; }
+    if (a[8] !== 'Pagado' && a[2]) {
+      const pend = r2_(a[3] - a[4]);
+      if (a[2] < hoy) {
+        vencM += pend; vencN++;
+        const m = morosos[a[0]] || (morosos[a[0]] = { VentaID: a[0], monto: 0, n: 0, dias: 0 });
+        m.monto += pend; m.n++; m.dias = Math.max(m.dias, dias_(a[2], hoy));
+      } else {
+        const d = dias_(hoy, a[2]);
+        if (d <= 7) { p7M += pend; p7N++; }
+        if (d <= 14) prox.push({ VentaID: a[0], Num: a[1], Vence: a[2], Pendiente: pend, Dias: d });
+      }
+    }
+  });
+  const nom = id => { const v = mios[id] || {}, c = M.cli[v.ClienteID] || {}; return c.Nombre || ''; };
+  const lote = id => { const v = mios[id] || {}; return etiq_(M.lot[v.LoteID]); };
+  const lotes = leer_('LOT', true), L = { total: lotes.length, disp: 0, apart: 0, vend: 0, valorDisp: 0 }, pf = {};
+  lotes.forEach(l => {
+    const f = pf[l.FraccID] || (pf[l.FraccID] = { n: (M.fra[l.FraccID] || {}).Nombre || '?', d: 0, a: 0, v: 0 });
+    if (l.Estatus === 'Disponible') { L.disp++; L.valorDisp += l.Precio; f.d++; } else if (l.Estatus === 'Apartado') { L.apart++; f.a++; } else { L.vend++; f.v++; }
+  });
+  const out = {
+    hoy: hoy, rol: u.rol,
+    lotes: Object.assign(L, { valorDisp: r2_(L.valorDisp), porFracc: Object.keys(pf).map(k => pf[k]) }),
+    ventas: { mesN: mesN, mesMonto: r2_(mesMonto), anioN: anioN, anioMonto: r2_(anioMonto), estatus: est, cartera: r2_(cartera), porMes: meses.map(k => ({ m: k, n: vm[k].n, monto: r2_(vm[k].monto) })) },
+    cobranza: { cobradoMes: r2_(cm[mesAct].monto), cobradoPrev: r2_(cm[prevKey] ? cm[prevKey].monto : 0), vencido: r2_(vencM), vencidoN: vencN, morosos: Object.keys(morosos).length, por7: r2_(p7M), por7N: p7N, porMes: meses.map(k => ({ m: k, monto: r2_(cm[k].monto) })) },
+    proximos: prox.sort((a, b) => a.Dias - b.Dias).slice(0, 8).map(x => Object.assign(x, { Cliente: nom(x.VentaID), Lote: lote(x.VentaID) })),
+    morosos: Object.keys(morosos).map(k => morosos[k]).sort((a, b) => b.monto - a.monto).slice(0, 8).map(x => Object.assign(x, { monto: r2_(x.monto), Cliente: nom(x.VentaID), Lote: lote(x.VentaID) })),
+    vendedores: u.rol === 'admin' ? Object.keys(porVend).map(k => ({ n: (M.usu[k] || {}).Nombre || k, ventas: porVend[k].n, monto: r2_(porVend[k].monto) })).sort((a, b) => b.monto - a.monto).slice(0, 6) : [],
+    clientes: leer_('CLI', true).filter(c => todo || c.VendedorID === u.id).length,
+    fraccs: leer_('FRA', true).filter(f => f.Estatus === 'Activo').length
+  };
+  cachePut_(key, out, 300);
+  return out;
+}
+
+/* ============================ NOTIFICACIONES ============================== */
+function hNotifList_(u) {
+  const N = +cfg_().DIAS_AVISO || 3, lista = abVentanaEnriq_(u).filter(a => a.Dias <= N);
+  return { total: lista.length, vencidos: lista.filter(a => a.Dias < 0).length, items: lista.slice(0, 30), dias: N };
+}
+function hNotifEnviar_(u) {
+  const r = notificacionesDiarias();
+  log_(u, 'NOTIF.MANUAL', JSON.stringify(r));
+  return r;
+}
+
+/* Se ejecuta con el disparador diario (también se puede lanzar a mano) */
+function notificacionesDiarias() {
+  return lock_(() => {
+    const cfg = cfg_(), N = +cfg.DIAS_AVISO || 3, hoy = hoy_(), nombre = cfg.EMPRESA_NOMBRE;
+    const sh = sheet_('ABO'), n = sh.getLastRow() - 1;
+    const res = { clientes: 0, admin: 0, avisos: 0, omitidos: 0 };
+    if (n < 1) return res;
+    const vals = sh.getRange(2, 1, n, TABLAS.ABO.cols.length).getValues();
+    const M = mapas_(), ven = {}; leer_('VEN', false).forEach(v => ven[v.ID] = v);
+    const items = []; let cambios = false;
+    vals.forEach((r, i) => {
+      if (r[0] === '' || r[8] === 'Pagado') return;
+      const v = ven[String(r[0])]; if (!v || v.Estatus !== 'Activa') return;
+      const vence = fmtD_(r[2]), ult = fmtD_(r[9]), d = dias_(hoy, vence); let tipo = null;
+      if (d < 0) { if (!ult || dias_(ult, hoy) >= 7) tipo = 'VENCIDO'; }
+      else if (d === 0) { if (ult !== hoy) tipo = 'HOY'; }
+      else if (d <= N) { if (!ult || dias_(ult, vence) > N) tipo = 'PROXIMO'; }
+      if (!tipo) return;
+      const c = M.cli[v.ClienteID] || {}, l = M.lot[v.LoteID] || {}, f = M.fra[l.FraccID] || {}, pend = r2_((+r[3] || 0) - (+r[4] || 0));
+      items.push({ tipo: tipo, dias: d, folio: v.ID, num: +r[1], plazo: v.Plazo, vence: vence, pendiente: pend, cliente: c.Nombre || '', email: c.Email || '', tel: c.Telefono || '', clienteId: v.ClienteID, lote: etiq_(l), fracc: f.Nombre || '' });
+      vals[i][9] = parseD_(hoy); cambios = true;
+    });
+    if (!items.length) return res;
+    res.avisos = items.length;
+    let cuota = MailApp.getRemainingDailyQuota() - 2;   // reserva para el resumen a administradores
+    // 1) Correo al cliente (uno por cliente con todos sus abonos)
+    if (cfg.AVISO_CLIENTE === 'SI') {
+      const porCli = {};
+      items.forEach(x => { if (x.email) (porCli[x.clienteId] || (porCli[x.clienteId] = [])).push(x); });
+      Object.keys(porCli).forEach(k => {
+        if (cuota <= 0) { res.omitidos++; return; }
+        const arr = porCli[k];
+        try {
+          MailApp.sendEmail({ to: arr[0].email, subject: 'Recordatorio de pago · ' + nombre, htmlBody: htmlCorreo_(cfg, 'Hola ' + escHtml_(arr[0].cliente) + ', te recordamos tus próximos pagos:', arr, true), name: nombre, replyTo: cfg.EMPRESA_EMAIL || undefined });
+          res.clientes++; cuota--;
+        } catch (e) { res.omitidos++; }
+      });
+    }
+    // 2) Resumen a administradores
+    const admins = leer_('USU', true).filter(x => x.Rol === 'admin' && x.Activo === 'SI').map(x => x.Email);
+    if (admins.length && cuota >= 0) {
+      try {
+        const venc = items.filter(x => x.tipo === 'VENCIDO').length;
+        MailApp.sendEmail({ to: admins.join(','), subject: '[' + nombre + '] Cobranza ' + hoy + ': ' + items.length + ' abonos (' + venc + ' vencidos)', htmlBody: htmlCorreo_(cfg, 'Resumen de cobranza del día:', items, false), name: nombre });
+        res.admin = admins.length;
+      } catch (e) {}
+    }
+    if (cambios) sh.getRange(2, TABLAS.ABO.cols.indexOf('UltAviso') + 1, n, 1).setValues(vals.map(r => [r[9]]));
+    try { podarBitacora_(); } catch (e) {}
+    return res;
+  });
+}
+
+function htmlCorreo_(cfg, intro, items, paraCliente) {
+  const col = { VENCIDO: '#dc2626', HOY: '#d97706', PROXIMO: '#0f766e' }, txt = { VENCIDO: 'Vencido', HOY: 'Vence hoy', PROXIMO: 'Próximo' };
+  const filas = items.sort((a, b) => a.dias - b.dias).map(x =>
+    '<tr><td style="padding:8px;border-bottom:1px solid #e5e7eb">' + (paraCliente ? '' : '<b>' + escHtml_(x.cliente) + '</b><br>') + escHtml_(x.fracc + ' · ' + x.lote) + '<br><span style="color:#6b7280;font-size:12px">' + escHtml_(x.folio) + '</span></td>' +
+    '<td style="padding:8px;border-bottom:1px solid #e5e7eb">' + (x.num === 0 ? 'Enganche' : 'Mensualidad ' + x.num + '/' + x.plazo) + '</td>' +
+    '<td style="padding:8px;border-bottom:1px solid #e5e7eb">' + escHtml_(x.vence) + '<br><b style="color:' + col[x.tipo] + '">' + (x.dias < 0 ? 'Vencido hace ' + (-x.dias) + ' día(s)' : x.dias === 0 ? 'Vence hoy' : 'En ' + x.dias + ' día(s)') + '</b></td>' +
+    '<td style="padding:8px;border-bottom:1px solid #e5e7eb;text-align:right"><b>' + pesos_(x.pendiente) + '</b></td></tr>').join('');
+  const pie = paraCliente
+    ? '<p style="color:#6b7280;font-size:13px">Si ya realizaste tu pago, haz caso omiso de este mensaje. ' + (cfg.EMPRESA_TEL ? 'Dudas: ' + escHtml_(cfg.EMPRESA_TEL) + '.' : '') + '</p>'
+    : '<p style="color:#6b7280;font-size:13px">Generado automáticamente por el sistema.</p>';
+  return '<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto;color:#111827"><div style="background:#0f766e;color:#fff;padding:16px 20px;border-radius:10px 10px 0 0"><h2 style="margin:0;font-size:18px">' + escHtml_(cfg.EMPRESA_NOMBRE) + '</h2></div><div style="border:1px solid #e5e7eb;border-top:0;padding:20px;border-radius:0 0 10px 10px"><p>' + intro + '</p><table style="width:100%;border-collapse:collapse;font-size:14px"><tr style="background:#f3f4f6"><th align="left" style="padding:8px">Lote</th><th align="left" style="padding:8px">Concepto</th><th align="left" style="padding:8px">Fecha</th><th align="right" style="padding:8px">Importe</th></tr>' + filas + '</table>' + pie + '</div></div>';
+}
+
+function podarBitacora_() {
+  const max = Math.max(200, +cfg_().BITACORA_MAX || 3000), sh = sheet_('LOG'), last = sh.getLastRow();
+  if (last - 1 > max) sh.deleteRows(2, last - 1 - max);
+}
